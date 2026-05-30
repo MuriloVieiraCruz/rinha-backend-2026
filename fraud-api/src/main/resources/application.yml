@@ -1,0 +1,27 @@
+server:
+  port: 8080
+  tomcat:
+    threads:
+      max: 4
+      min-spare: 4
+    accept-count: 2000
+    connection-timeout: 2000ms
+    accesslog:
+      enabled: false
+
+spring:
+  main:
+    banner-mode: off
+  jmx:
+    enabled: false
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: false
+
+logging:
+  level:
+    root: WARN
+    br.com.murilovieira: INFO
+
+app:
+  references-path: /resources/references.bin
