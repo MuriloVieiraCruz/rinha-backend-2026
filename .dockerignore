@@ -1,0 +1,19 @@
+# Dados pesados — não fazem parte do build da imagem
+resources/
+
+# Módulo preprocess — só o pom.xml é necessário (para o Maven resolver o reactor)
+preprocess/src/
+preprocess/target/
+
+# Artefatos de build local
+fraud-api/target/
+**/target/
+
+# IDEs e ferramentas
+.idea/
+*.iml
+.claude/
+
+# Outros
+*.log
+.git/

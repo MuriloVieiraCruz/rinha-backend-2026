@@ -4,6 +4,7 @@ RUN microdnf install -y maven findutils
 WORKDIR /app
 COPY pom.xml ./pom.xml
 COPY fraud-api/pom.xml ./fraud-api/pom.xml
+COPY preprocess/pom.xml ./preprocess/pom.xml
 RUN mvn dependency:go-offline -q -pl fraud-api -am
 
 COPY fraud-api/src ./fraud-api/src
