@@ -21,10 +21,6 @@ services:
     build:
       context: .
       dockerfile: fraud-api/Dockerfile
-    environment:
-      - APP_REFERENCES_PATH=/resources/references.bin
-    volumes:
-      - ./resources/references.bin:/resources/references.bin:ro
     networks:
       - rinha-net
     cpuset: "0"
@@ -38,10 +34,6 @@ services:
     build:
       context: .
       dockerfile: fraud-api/Dockerfile
-    environment:
-      - APP_REFERENCES_PATH=/resources/references.bin
-    volumes:
-      - ./resources/references.bin:/resources/references.bin:ro
     networks:
       - rinha-net
     cpuset: "1"

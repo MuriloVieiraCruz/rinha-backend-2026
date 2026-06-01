@@ -9,21 +9,18 @@ import org.springframework.stereotype.Service;
 @Service
 public class FraudService {
 
-    private static final int    K         = 5;
-    private static final double THRESHOLD = 0.4;
-
     private final Vectorizer  vectorizer;
     private final VectorStore vectorStore;
 
     public FraudService(Vectorizer vectorizer, VectorStore vectorStore) {
-        this.vectorizer = vectorizer;
+        this.vectorizer  = vectorizer;
         this.vectorStore = vectorStore;
     }
 
     public FraudResponse evaluate(TransactionRequest request) {
-        float[] vector     = vectorizer.vectorize(request);
-        int     fraudCount = vectorStore.knnFraudCount(vector, K);
-        double  fraudScore = (double) fraudCount / K;
-        return new FraudResponse(fraudScore < THRESHOLD, fraudScore);
+        float[] query  = VectorStore.threadQuery();
+        vectorizer.vectorize(request, query);
+        VectorStore.FraudResult result = vectorStore.search(query);
+        return new FraudResponse(result.approved(), result.fraudScore());
     }
 }

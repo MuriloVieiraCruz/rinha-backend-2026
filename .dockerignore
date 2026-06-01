@@ -1,12 +1,9 @@
-# Dados pesados — não fazem parte do build da imagem
-resources/
-
-# Módulo preprocess — só o pom.xml é necessário (para o Maven resolver o reactor)
-preprocess/src/
-preprocess/target/
+# Não inclui o binário gerado — será reconstruído dentro do Docker
+resources/references.bin
 
 # Artefatos de build local
 fraud-api/target/
+preprocess/target/
 **/target/
 
 # IDEs e ferramentas

@@ -15,12 +15,13 @@ public class ApplicationHints implements RuntimeHintsRegistrar {
                 .registerPattern("mcc_risk.json");
 
         hints.reflection()
-                .registerType(TransactionRequest.class,           MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
-                .registerType(TransactionRequest.Transaction.class,    MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
-                .registerType(TransactionRequest.Customer.class,       MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
-                .registerType(TransactionRequest.Merchant.class,       MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
-                .registerType(TransactionRequest.Terminal.class,       MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
+                .registerType(NormalizationConfig.class,                MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
+                .registerType(TransactionRequest.class,                 MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
+                .registerType(TransactionRequest.Transaction.class,     MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
+                .registerType(TransactionRequest.Customer.class,        MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
+                .registerType(TransactionRequest.Merchant.class,        MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
+                .registerType(TransactionRequest.Terminal.class,        MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
                 .registerType(TransactionRequest.LastTransaction.class, MemberCategory.INVOKE_DECLARED_CONSTRUCTORS)
-                .registerType(FraudResponse.class,                MemberCategory.INVOKE_DECLARED_CONSTRUCTORS);
+                .registerType(FraudResponse.class,                      MemberCategory.INVOKE_DECLARED_CONSTRUCTORS);
     }
 }

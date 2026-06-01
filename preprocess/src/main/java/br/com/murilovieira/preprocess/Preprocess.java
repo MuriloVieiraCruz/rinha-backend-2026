@@ -3,358 +3,289 @@ package br.com.murilovieira.preprocess;
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonToken;
 
-import java.io.IOException;
-import java.io.InputStream;
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.channels.FileChannel;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.Arrays;
 import java.util.Random;
-import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.stream.IntStream;
 import java.util.zip.GZIPInputStream;
 
-import static java.nio.file.StandardOpenOption.*;
-
 public final class Preprocess {
 
-    private static final int    DIM          = 14;
-    private static final int    K_CLUSTERS   = 2048;
-    private static final int    K_SUPER      = 128;
-    private static final int    K_ITERS      = 25;
-    private static final int    QUANT_SCALE  = 10_000;
-    private static final int    HEADER_BYTES = 64;
-    private static final byte[] MAGIC        = {'R', 'N', 'H', '6'};
-    private static final long   SEED         = 42L;
+    static final int    DIM         = 14;
+    static final int    K           = 2048;
+    static final int    MAX_CLUSTER = 1024;
+    static final int    ITERS       = 12;
+    static final int    SAMPLE      = 200_000;
+    static final int    MAGIC       = 0x52454653;
+    static final int    VERSION     = 4;
+    static final int    SCALE       = 10_000;
+    static final long   SEED        = 0x9E3779B97F4A7C15L;
 
-    private static float[] data;
-    private static byte[]  labels;
+    public static void main(String[] args) throws Exception {
+        String inputPath  = args.length > 0 ? args[0] : "../resources/references.json.gz";
+        String outputPath = args.length > 1 ? args[1] : "../resources/refs.bin";
 
-    public static void main(String[] args) throws IOException {
-        Path input  = Path.of(args.length > 0 ? args[0] : "../resources/references.json.gz");
-        Path output = Path.of(args.length > 1 ? args[1] : "../resources/references.bin");
         long t0 = System.currentTimeMillis();
 
-        System.out.println("[1/6] Lendo dataset...");
-        int n = load(input);
+        System.out.println("[1/5] Lendo dataset e quantizando...");
+        int MAX = 3_100_000;
+        short[] flat   = new short[MAX * DIM];
+        byte[]  labels = new byte[MAX];
+        int n = load(inputPath, flat, labels);
         System.out.printf("  %,d vetores carregados%n", n);
 
-        System.out.printf("[2/6] K-means k=%d iters=%d (k-means++ init)...%n", K_CLUSTERS, K_ITERS);
-        float[] centroids   = kMeans(data, n, K_CLUSTERS, K_ITERS);
-        int[]   assignment  = assign(data, n, centroids, K_CLUSTERS);
+        System.out.printf("[2/5] K-means k=%d em amostra de %,d (k-means++, %d iters)...%n", K, SAMPLE, ITERS);
+        Random rng = new Random(SEED);
+        short[] centroids = kmeans(sample(flat, n, SAMPLE, rng), Math.min(K, n), rng);
+        int k = centroids.length / DIM;
 
-        System.out.printf("[3/6] Super-clusters ks=%d...%n", K_SUPER);
-        float[] superCentroids = kMeans(centroids, K_CLUSTERS, K_SUPER, K_ITERS);
-        int[]   superAssign    = assign(centroids, K_CLUSTERS, superCentroids, K_SUPER);
+        int[] coarse = assignAll(flat, n, centroids, k);
 
-        System.out.println("[4/6] Layout, bbox e quantização...");
-        int[]   offsets = buildOffsets(assignment, n, K_CLUSTERS);
-        int[]   perm    = buildPermutation(assignment, offsets, n, K_CLUSTERS);
-        short[] rows    = reorderAndQuantize(data, perm, n);
-        data = null;
+        System.out.println("[3/5] Dividindo clusters grandes...");
+        int[][] inverted  = invert(coarse, n, k);
+        int[]   finalAssign = new int[n];
+        int     kFinal    = 0, splits = 0;
 
-        short[] centroidsQ      = quantize(centroids, K_CLUSTERS);
-        short[] superCentroidsQ = quantize(superCentroids, K_SUPER);
+        for (int c = 0; c < k; c++) {
+            int[] members = inverted[c];
+            if (members.length <= MAX_CLUSTER) {
+                int id = kFinal++;
+                for (int p : members) finalAssign[p] = id;
+            } else {
+                splits++;
+                short[] sub  = gather(flat, members);
+                int     subK = (members.length + MAX_CLUSTER - 1) / MAX_CLUSTER;
+                short[] subC = kmeans(sub, subK, new Random(SEED + c + 1));
+                int     subKA = subC.length / DIM;
+                int[]   subA = assignAll(sub, members.length, subC, subKA);
+                int[]   subIds = new int[subKA];
+                for (int s = 0; s < subKA; s++) subIds[s] = kFinal++;
+                for (int j = 0; j < members.length; j++) finalAssign[members[j]] = subIds[subA[j]];
+            }
+        }
+        System.out.printf("  %d coarse → %d clusters finais (%d divididos)%n", k, kFinal, splits);
 
-        short[] bboxMin = new short[K_CLUSTERS * DIM];
-        short[] bboxMax = new short[K_CLUSTERS * DIM];
-        computeBboxes(rows, offsets, K_CLUSTERS, bboxMin, bboxMax);
+        System.out.println("[4/5] Calculando offsets, centroides, bboxes...");
+        int[] offsets = new int[kFinal + 1];
+        for (int i = 0; i < n; i++) offsets[finalAssign[i] + 1]++;
+        for (int c = 0; c < kFinal; c++) offsets[c + 1] += offsets[c];
 
-        int[]   superOffsets  = buildSuperOffsets(superAssign, K_SUPER, K_CLUSTERS);
-        int[]   superClusters = buildSuperClusters(superAssign, superOffsets, K_SUPER, K_CLUSTERS);
-        short[] superBboxMin  = new short[K_SUPER * DIM];
-        short[] superBboxMax  = new short[K_SUPER * DIM];
-        computeSuperBboxes(bboxMin, bboxMax, superClusters, superOffsets, K_SUPER, superBboxMin, superBboxMax);
+        short[] rows     = new short[n * DIM];
+        byte[]  outLab   = new byte[n];
+        int[]   origIds  = new int[n];
+        short[] cOut     = new short[kFinal * DIM];
+        short[] bMin     = new short[kFinal * DIM];
+        short[] bMax     = new short[kFinal * DIM];
+        long[]  acc      = new long[kFinal * DIM];
 
-        System.out.println("[5/6] Reordenando labels...");
-        byte[] labelsReordered = new byte[n];
-        for (int i = 0; i < n; i++) labelsReordered[i] = labels[perm[i]];
-        labels = null;
+        for (int c = 0; c < kFinal; c++) {
+            int cb = c * DIM;
+            Arrays.fill(bMin, cb, cb + DIM, Short.MAX_VALUE);
+            Arrays.fill(bMax, cb, cb + DIM, Short.MIN_VALUE);
+        }
 
-        System.out.println("[6/6] Escrevendo RNH6...");
-        Path tmp = output.resolveSibling(output.getFileName() + ".tmp");
-        write(tmp, n, K_CLUSTERS, K_SUPER,
-              offsets, centroidsQ, bboxMin, bboxMax,
-              superOffsets, superClusters, superCentroidsQ, superBboxMin, superBboxMax,
-              rows, labelsReordered);
-        Files.move(tmp, output, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        int[] cursor = Arrays.copyOf(offsets, kFinal);
+        for (int i = 0; i < n; i++) {
+            int c   = finalAssign[i];
+            int pos = cursor[c]++;
+            int src = i * DIM, dst = pos * DIM, cb = c * DIM;
+            for (int d = 0; d < DIM; d++) {
+                short v = flat[src + d];
+                rows[dst + d] = v;
+                if (v < bMin[cb + d]) bMin[cb + d] = v;
+                if (v > bMax[cb + d]) bMax[cb + d] = v;
+                acc[cb + d] += v;
+            }
+            outLab[pos]  = labels[i];
+            origIds[pos] = i;
+        }
+        for (int c = 0; c < kFinal; c++) {
+            int cnt = offsets[c + 1] - offsets[c];
+            if (cnt == 0) continue;
+            int cb = c * DIM;
+            for (int d = 0; d < DIM; d++) cOut[cb + d] = (short) Math.round((double) acc[cb + d] / cnt);
+        }
 
-        System.out.printf("Concluído em %.1fs → %s%n",
-                (System.currentTimeMillis() - t0) / 1000.0, output.toAbsolutePath());
+        System.out.printf("[5/5] Escrevendo %s...%n", outputPath);
+        try (DataOutputStream dos = new DataOutputStream(
+                new BufferedOutputStream(new FileOutputStream(outputPath), 1 << 23))) {
+            dos.writeInt(MAGIC);
+            dos.writeInt(VERSION);
+            dos.writeInt(n);
+            dos.writeInt(kFinal);
+            writeShorts(dos, cOut);
+            writeShorts(dos, bMin);
+            writeShorts(dos, bMax);
+            writeInts(dos, offsets);
+            writeShorts(dos, rows);
+            dos.write(outLab);
+            writeInts(dos, origIds);
+        }
+
+        long size = new File(outputPath).length();
+        System.out.printf("Concluído em %.1fs → %,d bytes (%.1f MB)%n",
+                (System.currentTimeMillis() - t0) / 1000.0, size, size / 1_048_576.0);
     }
 
-    // ── Leitura do dataset ────────────────────────────────────────────────────
-
-    private static int load(Path input) throws IOException {
-        int cap = 3_200_000;
-        data   = new float[cap * DIM];
-        labels = new byte[cap];
-        int n  = 0;
-
-        try (InputStream raw = Files.newInputStream(input);
+    private static int load(String path, short[] flat, byte[] labels) throws IOException {
+        int n = 0;
+        try (InputStream raw = new FileInputStream(path);
              GZIPInputStream gz = new GZIPInputStream(raw, 64 * 1024);
              var p = new JsonFactory().createParser(gz)) {
 
             if (p.nextToken() != JsonToken.START_ARRAY) throw new IOException("JSON array esperado");
 
             while (p.nextToken() == JsonToken.START_OBJECT) {
-                if (n >= cap) {
-                    cap = cap + (cap >> 1);
-                    data   = Arrays.copyOf(data,   cap * DIM);
-                    labels = Arrays.copyOf(labels, cap);
-                }
-                int    base = n * DIM;
-                int    vi   = 0;
-                byte   lbl  = -1;
+                int base = n * DIM, vi = 0;
+                byte lbl = -1;
                 while (p.nextToken() != JsonToken.END_OBJECT) {
                     String field = p.currentName();
                     p.nextToken();
                     if ("vector".equals(field)) {
-                        while (p.nextToken() != JsonToken.END_ARRAY)
-                            data[base + vi++] = p.getFloatValue();
+                        while (p.nextToken() != JsonToken.END_ARRAY) {
+                            int q = Math.round(p.getFloatValue() * SCALE);
+                            flat[base + vi++] = (short) (q > SCALE ? SCALE : q < -SCALE ? -SCALE : q);
+                        }
                     } else if ("label".equals(field)) {
-                        lbl = "fraud".equals(p.getText()) ? (byte) 1 : (byte) 0;
+                        lbl = "fraud".equals(p.getText()) ? (byte) 1 : 0;
                     } else {
                         p.skipChildren();
                     }
                 }
-                if (vi != DIM || lbl < 0) throw new IOException("Registro inválido em índice " + n);
                 labels[n++] = lbl;
                 if (n % 500_000 == 0) System.out.printf("  ... %,d%n", n);
             }
         }
-        data   = Arrays.copyOf(data,   n * DIM);
-        labels = Arrays.copyOf(labels, n);
         return n;
     }
 
-    // ── K-means com k-means++ e atribuição paralela ───────────────────────────
-
-    private static float[] kMeans(float[] data, int n, int k, int iters) {
-        Random rng = new Random(SEED);
-        float[] centroids = kMeansPlusPlusInit(data, n, k, rng);
-
-        int[]   assignment = new int[n];
-        float[] sums       = new float[k * DIM];
-        int[]   counts     = new int[k];
-
-        for (int iter = 0; iter < iters; iter++) {
-            assignParallel(data, n, centroids, k, assignment);
-            Arrays.fill(sums, 0f);
-            Arrays.fill(counts, 0);
-            for (int i = 0; i < n; i++) {
-                int c = assignment[i], cb = c * DIM, db = i * DIM;
-                counts[c]++;
-                for (int d = 0; d < DIM; d++) sums[cb + d] += data[db + d];
+    static short[] kmeans(short[] data, int k, Random rng) {
+        int m = data.length / DIM;
+        k = Math.min(k, m);
+        short[] cents  = kmeansPlusPlus(data, m, k, rng);
+        int[]   assign = new int[m];
+        for (int iter = 0; iter < ITERS; iter++) {
+            assignInto(data, m, cents, k, assign);
+            long[] acc = new long[k * DIM];
+            int[]  cnt = new int[k];
+            for (int i = 0; i < m; i++) {
+                int c = assign[i], src = i * DIM, cb = c * DIM;
+                cnt[c]++;
+                for (int d = 0; d < DIM; d++) acc[cb + d] += data[src + d];
             }
             for (int c = 0; c < k; c++) {
-                if (counts[c] > 0) {
-                    int cb = c * DIM; float inv = 1f / counts[c];
-                    for (int d = 0; d < DIM; d++) centroids[cb + d] = sums[cb + d] * inv;
-                } else {
-                    System.arraycopy(data, rng.nextInt(n) * DIM, centroids, c * DIM, DIM);
-                }
+                if (cnt[c] == 0) continue;
+                int cb = c * DIM;
+                for (int d = 0; d < DIM; d++)
+                    cents[cb + d] = (short) Math.round((double) acc[cb + d] / cnt[c]);
             }
-            System.out.printf("  iter %d/%d%n", iter + 1, iters);
         }
-        return centroids;
+        return cents;
     }
 
-    private static float[] kMeansPlusPlusInit(float[] data, int n, int k, Random rng) {
-        float[] centroids = new float[k * DIM];
-        int     first     = rng.nextInt(n);
-        System.arraycopy(data, first * DIM, centroids, 0, DIM);
-
-        float[] minDist = new float[n];
-        Arrays.fill(minDist, Float.MAX_VALUE);
+    private static short[] kmeansPlusPlus(short[] data, int m, int k, Random rng) {
+        short[] cents = new short[k * DIM];
+        long[]  dist  = new long[m];
+        int first = rng.nextInt(m);
+        System.arraycopy(data, first * DIM, cents, 0, DIM);
+        for (int i = 0; i < m; i++) dist[i] = sqDist(data, i * DIM, cents, 0);
 
         for (int c = 1; c < k; c++) {
-            int prevBase = (c - 1) * DIM;
             double total = 0;
-            for (int i = 0; i < n; i++) {
-                float d = distSq(data, i, centroids, c - 1, prevBase);
-                if (d < minDist[i]) minDist[i] = d;
-                total += minDist[i];
+            for (long dd : dist) total += dd;
+            double threshold = rng.nextDouble() * total, cum = 0;
+            int chosen = m - 1;
+            for (int i = 0; i < m; i++) { cum += dist[i]; if (cum >= threshold) { chosen = i; break; } }
+            int cb = c * DIM;
+            System.arraycopy(data, chosen * DIM, cents, cb, DIM);
+            for (int i = 0; i < m; i++) {
+                long d = sqDist(data, i * DIM, cents, cb);
+                if (d < dist[i]) dist[i] = d;
             }
-            double target = rng.nextDouble() * total;
-            int chosen = 0;
-            for (int i = 0; i < n; i++) {
-                target -= minDist[i];
-                if (target <= 0) { chosen = i; break; }
-            }
-            System.arraycopy(data, chosen * DIM, centroids, c * DIM, DIM);
         }
-        return centroids;
+        return cents;
     }
 
-    private static void assignParallel(float[] data, int n, float[] centroids, int k, int[] out) {
-        IntStream.range(0, n).parallel().forEach(i -> {
-            float best = Float.MAX_VALUE;
-            int   bi   = 0;
-            for (int c = 0; c < k; c++) {
-                float d = distSq(data, i, centroids, c, c * DIM);
-                if (d < best) { best = d; bi = c; }
-            }
-            out[i] = bi;
-        });
+    static void assignInto(short[] data, int m, short[] cents, int k, int[] out) {
+        IntStream.range(0, m).parallel().forEach(i -> out[i] = nearest(data, i * DIM, cents, k));
     }
 
-    private static int[] assign(float[] data, int n, float[] centroids, int k) {
-        int[] out = new int[n];
-        assignParallel(data, n, centroids, k, out);
+    static int[] assignAll(short[] data, int m, short[] cents, int k) {
+        int[] out = new int[m];
+        assignInto(data, m, cents, k, out);
         return out;
     }
 
-    private static float distSq(float[] a, int ai, float[] b, int bi, int bBase) {
-        int   aBase = ai * DIM;
-        float sum   = 0;
-        for (int d = 0; d < DIM; d++) { float diff = a[aBase + d] - b[bBase + d]; sum += diff * diff; }
-        return sum;
-    }
-
-    // ── Layout e quantização ──────────────────────────────────────────────────
-
-    private static int[] buildOffsets(int[] assignment, int n, int k) {
-        int[] counts = new int[k];
-        for (int i = 0; i < n; i++) counts[assignment[i]]++;
-        int[] offsets = new int[k + 1];
-        for (int c = 0; c < k; c++) offsets[c + 1] = offsets[c] + counts[c];
-        return offsets;
-    }
-
-    private static int[] buildPermutation(int[] assignment, int[] offsets, int n, int k) {
-        int[] pos  = Arrays.copyOf(offsets, k);
-        int[] perm = new int[n];
-        for (int i = 0; i < n; i++) perm[pos[assignment[i]]++] = i;
-        return perm;
-    }
-
-    private static short[] reorderAndQuantize(float[] data, int[] perm, int n) {
-        short[] rows = new short[n * DIM];
-        for (int i = 0; i < n; i++) {
-            int src = perm[i] * DIM, dst = i * DIM;
-            for (int d = 0; d < DIM; d++) {
-                int q = Math.round(data[src + d] * QUANT_SCALE);
-                rows[dst + d] = (short) Math.max(-QUANT_SCALE, Math.min(QUANT_SCALE, q));
-            }
-        }
-        return rows;
-    }
-
-    private static short[] quantize(float[] centroids, int k) {
-        short[] out = new short[k * DIM];
-        for (int i = 0; i < k * DIM; i++) {
-            int q = Math.round(centroids[i] * QUANT_SCALE);
-            out[i] = (short) Math.max(-QUANT_SCALE, Math.min(QUANT_SCALE, q));
-        }
-        return out;
-    }
-
-    // ── Bboxes ────────────────────────────────────────────────────────────────
-
-    private static void computeBboxes(short[] rows, int[] offsets, int k,
-                                      short[] bboxMin, short[] bboxMax) {
-        Arrays.fill(bboxMin, Short.MAX_VALUE);
-        Arrays.fill(bboxMax, Short.MIN_VALUE);
+    private static int nearest(short[] data, int off, short[] cents, int k) {
+        int best = 0;
+        long bestD = Long.MAX_VALUE;
         for (int c = 0; c < k; c++) {
-            int base = c * DIM;
-            for (int i = offsets[c]; i < offsets[c + 1]; i++) {
-                int rb = i * DIM;
-                for (int d = 0; d < DIM; d++) {
-                    if (rows[rb + d] < bboxMin[base + d]) bboxMin[base + d] = rows[rb + d];
-                    if (rows[rb + d] > bboxMax[base + d]) bboxMax[base + d] = rows[rb + d];
-                }
-            }
-            if (offsets[c] == offsets[c + 1]) {
-                Arrays.fill(bboxMin, base, base + DIM, (short) 0);
-                Arrays.fill(bboxMax, base, base + DIM, (short) 0);
-            }
+            long d = sqDist(data, off, cents, c * DIM);
+            if (d < bestD) { bestD = d; best = c; }
+        }
+        return best;
+    }
+
+    static long sqDist(short[] a, int ao, short[] b, int bo) {
+        long s = 0;
+        for (int d = 0; d < DIM; d++) { int e = a[ao + d] - b[bo + d]; s += (long) e * e; }
+        return s;
+    }
+
+    private static short[] sample(short[] flat, int n, int s, Random rng) {
+        if (s >= n) return Arrays.copyOf(flat, n * DIM);
+        short[] out = new short[s * DIM];
+        for (int i = 0; i < s; i++) {
+            int src = rng.nextInt(n) * DIM;
+            System.arraycopy(flat, src, out, i * DIM, DIM);
+        }
+        return out;
+    }
+
+    private static int[][] invert(int[] assign, int n, int k) {
+        int[] sizes = new int[k];
+        for (int i = 0; i < n; i++) sizes[assign[i]]++;
+        int[][] out = new int[k][];
+        for (int c = 0; c < k; c++) out[c] = new int[sizes[c]];
+        int[] pos = new int[k];
+        for (int i = 0; i < n; i++) { int c = assign[i]; out[c][pos[c]++] = i; }
+        return out;
+    }
+
+    private static short[] gather(short[] flat, int[] ids) {
+        short[] out = new short[ids.length * DIM];
+        for (int j = 0; j < ids.length; j++)
+            System.arraycopy(flat, ids[j] * DIM, out, j * DIM, DIM);
+        return out;
+    }
+
+    private static void writeShorts(DataOutputStream dos, short[] arr) throws IOException {
+        byte[]     buf = new byte[1 << 22];
+        ByteBuffer bb  = ByteBuffer.wrap(buf).order(ByteOrder.BIG_ENDIAN);
+        int remaining = arr.length, offset = 0;
+        while (remaining > 0) {
+            int chunk = Math.min(remaining, buf.length / 2);
+            bb.clear();
+            bb.asShortBuffer().put(arr, offset, chunk);
+            dos.write(buf, 0, chunk * 2);
+            offset += chunk;
+            remaining -= chunk;
         }
     }
 
-    private static int[] buildSuperOffsets(int[] superAssign, int ks, int k) {
-        int[] counts  = new int[ks];
-        for (int c = 0; c < k; c++) counts[superAssign[c]]++;
-        int[] offsets = new int[ks + 1];
-        for (int s = 0; s < ks; s++) offsets[s + 1] = offsets[s] + counts[s];
-        return offsets;
-    }
-
-    private static int[] buildSuperClusters(int[] superAssign, int[] superOffsets, int ks, int k) {
-        int[] pos           = Arrays.copyOf(superOffsets, ks);
-        int[] superClusters = new int[k];
-        for (int c = 0; c < k; c++) superClusters[pos[superAssign[c]]++] = c;
-        return superClusters;
-    }
-
-    private static void computeSuperBboxes(short[] bboxMin, short[] bboxMax,
-                                           int[] superClusters, int[] superOffsets, int ks,
-                                           short[] superBboxMin, short[] superBboxMax) {
-        Arrays.fill(superBboxMin, Short.MAX_VALUE);
-        Arrays.fill(superBboxMax, Short.MIN_VALUE);
-        for (int s = 0; s < ks; s++) {
-            int sb = s * DIM;
-            for (int i = superOffsets[s]; i < superOffsets[s + 1]; i++) {
-                int cb = superClusters[i] * DIM;
-                for (int d = 0; d < DIM; d++) {
-                    if (bboxMin[cb + d] < superBboxMin[sb + d]) superBboxMin[sb + d] = bboxMin[cb + d];
-                    if (bboxMax[cb + d] > superBboxMax[sb + d]) superBboxMax[sb + d] = bboxMax[cb + d];
-                }
-            }
-            if (superOffsets[s] == superOffsets[s + 1]) {
-                Arrays.fill(superBboxMin, sb, sb + DIM, (short) 0);
-                Arrays.fill(superBboxMax, sb, sb + DIM, (short) 0);
-            }
+    private static void writeInts(DataOutputStream dos, int[] arr) throws IOException {
+        byte[]     buf = new byte[1 << 22];
+        ByteBuffer bb  = ByteBuffer.wrap(buf).order(ByteOrder.BIG_ENDIAN);
+        int remaining = arr.length, offset = 0;
+        while (remaining > 0) {
+            int chunk = Math.min(remaining, buf.length / 4);
+            bb.clear();
+            bb.asIntBuffer().put(arr, offset, chunk);
+            dos.write(buf, 0, chunk * 4);
+            offset += chunk;
+            remaining -= chunk;
         }
-    }
-
-    // ── Escrita do binário RNH6 ───────────────────────────────────────────────
-
-    private static void write(Path out, int n, int k, int ks,
-                              int[] offsets, short[] centroids, short[] bboxMin, short[] bboxMax,
-                              int[] superOffsets, int[] superClusters,
-                              short[] superCentroids, short[] superBboxMin, short[] superBboxMax,
-                              short[] rows, byte[] labels) throws IOException {
-        try (FileChannel ch = FileChannel.open(out, CREATE, WRITE, TRUNCATE_EXISTING)) {
-            ByteBuffer hdr = ByteBuffer.allocate(HEADER_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-            hdr.put(MAGIC).putInt(n).putInt(k).putInt(ks).putInt(DIM).putInt(QUANT_SCALE);
-            hdr.position(HEADER_BYTES).flip();
-            ch.write(hdr);
-
-            writeInts(ch, offsets);
-            writeShorts(ch, centroids);
-            writeShorts(ch, bboxMin);
-            writeShorts(ch, bboxMax);
-            writeInts(ch, superOffsets);
-            writeInts(ch, superClusters);
-            writeShorts(ch, superCentroids);
-            writeShorts(ch, superBboxMin);
-            writeShorts(ch, superBboxMax);
-            writeShorts(ch, rows);
-            ch.write(ByteBuffer.wrap(labels));
-
-            System.out.printf("  %,d bytes escritos%n", ch.size());
-        }
-    }
-
-    private static void writeShorts(FileChannel ch, short[] arr) throws IOException {
-        ByteBuffer buf = ByteBuffer.allocateDirect(65536).order(ByteOrder.LITTLE_ENDIAN);
-        for (short s : arr) {
-            if (!buf.hasRemaining()) { buf.flip(); ch.write(buf); buf.clear(); }
-            buf.putShort(s);
-        }
-        if (buf.position() > 0) { buf.flip(); ch.write(buf); }
-    }
-
-    private static void writeInts(FileChannel ch, int[] arr) throws IOException {
-        ByteBuffer buf = ByteBuffer.allocateDirect(65536).order(ByteOrder.LITTLE_ENDIAN);
-        for (int v : arr) {
-            if (buf.remaining() < Integer.BYTES) { buf.flip(); ch.write(buf); buf.clear(); }
-            buf.putInt(v);
-        }
-        if (buf.position() > 0) { buf.flip(); ch.write(buf); }
     }
 }
